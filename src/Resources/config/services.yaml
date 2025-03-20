@@ -1,0 +1,141 @@
+services:
+    # Redis factory service
+    staccache.redis.factory:
+        class: Phillarmonic\StaccacheBundle\Redis\StaccacheRedisFactory
+        calls:
+            - [setContainer, ['@service_container']]
+
+    # Redis client service - created based on configuration
+    staccache.redis.client:
+        class: Phillarmonic\StaccacheBundle\Redis\RedisClientInterface
+        factory: ['@staccache.redis.factory', 'createClient']
+        arguments: ['%staccache.redis_config%']
+
+    # Raw Redis client for lock store
+    staccache.redis.raw_client:
+        class: Redis
+        factory: ['@staccache.redis.factory', 'createRawClient']
+        arguments: ['%staccache.redis_config%']
+
+    # Interface alias
+    Phillarmonic\StaccacheBundle\Redis\RedisClientInterface:
+        alias: staccache.redis.client
+
+    # Lock services
+    staccache.redis.store:
+        class: Symfony\Component\Lock\Store\RedisStore
+        arguments: ['@staccache.redis.raw_client']
+
+    staccache.lock.factory:
+        class: Symfony\Component\Lock\LockFactory
+        arguments: ['@staccache.redis.store']
+
+    # Logger service (with null logger fallback)
+    staccache.logger:
+        class: Psr\Log\LoggerInterface
+        factory: 'logger_factory:createNamedLogger'
+        arguments: ['staccache']
+
+    # Custom denormalizer for IDs
+    staccache.id_aware_entity_denormalizer:
+        class: Phillarmonic\StaccacheBundle\Serializer\IdAwareEntityDenormalizer
+        arguments:
+            - '@doctrine'
+            - '@?staccache.logger'
+        tags:
+            - { name: serializer.normalizer, priority: 1000 }  # Higher priority to run first
+
+    staccache.entity_denormalizer:
+        class: Phillarmonic\StaccacheBundle\Serializer\EntityDenormalizer
+        arguments:
+            - '@serializer.normalizer.object'
+            - '@doctrine'
+            - '@?staccache.logger'
+        tags:
+            - { name: serializer.normalizer, priority: 950 }   # Run after IdAwareEntityDenormalizer
+
+    # Entity cache manager with enhanced serialization
+    staccache.cache_manager:
+        class: Phillarmonic\StaccacheBundle\Cache\EntityCacheManager
+        arguments:
+            - '@staccache.redis.client'
+            - '@staccache.lock.factory'
+            - '@serializer'
+            - '@doctrine'
+            - '%staccache.default_ttl%'
+            - '%staccache.lock_ttl%'
+            - '%staccache.cache_prefix%'
+            - '%staccache.secret_key%'
+            - '@?staccache.logger'
+
+    Phillarmonic\StaccacheBundle\Cache\EntityCacheManager:
+        alias: staccache.cache_manager
+
+    # Query cache manager
+    staccache.query_cache_manager:
+        class: Phillarmonic\StaccacheBundle\Cache\QueryCacheManager
+        arguments:
+            - '@staccache.redis.client'
+            - '@staccache.cache_manager'
+            - '@doctrine'
+            - '%staccache.default_ttl%'
+            - '%staccache.cache_prefix%'
+            - '%staccache.secret_key%'
+            - '@?staccache.logger'
+
+    Phillarmonic\StaccacheBundle\Cache\QueryCacheManager:
+        alias: staccache.query_cache_manager
+
+    # Repository factory
+    staccache.repository_factory:
+        class: Phillarmonic\StaccacheBundle\Repository\CachedRepositoryFactory
+        arguments: ['@staccache.cache_manager']
+
+    Phillarmonic\StaccacheBundle\Repository\CachedRepositoryFactory:
+        alias: staccache.repository_factory
+
+    # Doctrine event listener
+    staccache.doctrine_listener:
+     class: Phillarmonic\StaccacheBundle\EventListener\EntityCacheListener
+     arguments:
+         - '@staccache.cache_manager'
+         - '%staccache.auto_cache_on_load%'
+         - '@staccache.query_cache_manager'
+         - '@?staccache.logger'
+     tags:
+         - { name: doctrine.event_listener, event: postLoad }
+         - { name: doctrine.event_listener, event: preUpdate }
+         - { name: doctrine.event_listener, event: preRemove }
+         - { name: doctrine.event_listener, event: postPersist }
+         - { name: doctrine.event_listener, event: postUpdate }
+         - { name: doctrine.event_listener, event: postRemove }
+         - { name: doctrine.event_listener, event: postFlush }
+
+    # Register the cached entity value resolver
+    staccache.cached_entity_value_resolver:
+        class: Phillarmonic\StaccacheBundle\Request\CachedEntityValueResolver
+        arguments:
+            - '@doctrine'
+            - '@staccache.cache_manager'
+            - '@?staccache.logger'
+        tags:
+            - { name: controller.argument_value_resolver, priority: 150 }
+
+    # Form submission listener to update cache
+    staccache.form_submit_cache_listener:
+        class: Phillarmonic\StaccacheBundle\EventListener\FormSubmitCacheListener
+        arguments: ['@staccache.cache_manager']
+        tags:
+            - { name: kernel.event_subscriber }
+
+    staccache.purge_command:
+        class: Phillarmonic\StaccacheBundle\Command\StaccachePurgeCommand
+        arguments:
+            - '@staccache.cache_manager'
+            - '@staccache.query_cache_manager'
+            - '@staccache.redis.client'
+            - '@doctrine'
+            - '%staccache.cache_prefix%'
+            - '@?staccache.logger'
+        tags:
+            - { name: console.command }
